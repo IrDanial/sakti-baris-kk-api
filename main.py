@@ -7,7 +7,11 @@ from pydantic import BaseModel, HttpUrl
 from rapidocr import RapidOCR
 
 # 1. Initialize FastAPI app
-app = FastAPI(title="Baris KK API")
+app = FastAPI(
+    title="Baris KK API",
+    description="API Untuk Mengekstrak Jumlah Anggota Keluarga dari Kartu Keluarga",
+    version="1.1.0"
+)
 
 # 2. Initialize engine globally
 engine = RapidOCR()
