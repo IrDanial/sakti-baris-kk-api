@@ -4,3 +4,4 @@ requests
 pydantic
 rapidocr
 opencv-python-headless
+PyMuPDF
