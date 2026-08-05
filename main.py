@@ -1,27 +1,22 @@
 import re
 import os
 import tempfile
-import requests
+import shutil
 import fitz  # PyMuPDF
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from rapidocr_onnxruntime import RapidOCR
 
 # 1. Initialize FastAPI app
 app = FastAPI(
     title="Baris KK API",
     description="API Untuk Mengekstrak Jumlah Anggota Keluarga dari Kartu Keluarga",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # 2. Initialize engine globally
 engine = RapidOCR()
 
-# 3. Define the expected request payload
-class DocumentRequest(BaseModel):
-    file_url: HttpUrl
-
-# 4. Core Image Processing Pipeline
+# 3. Core Image Processing Pipeline
 def extract_nik_pipeline(img_path):
     """
     Takes an image path as input, runs RapidOCR, and extracts valid 16-digit NIKs.
@@ -47,7 +42,7 @@ def extract_nik_pipeline(img_path):
                 context_window = " ".join(txts[start_index : i+1]).upper()
                 
                 if "KK" in context_window or "KELUARGA" in context_window:
-                    print(f"Skipping detected Family ID (No. KK): {matches[0]}")
+                    print(f"Skipping detected Family ID")
                     continue
                 
                 valid_niks.extend(matches)
@@ -55,7 +50,8 @@ def extract_nik_pipeline(img_path):
     match_count = len(valid_niks)
     return match_count, valid_niks
 
-# 5. PDF Processing Pipeline
+# 4. PDF Processing Pipeline
+# 4. PDF Processing Pipeline
 def process_pdf(pdf_path):
     """
     Opens a PDF, converts each page to an image, and runs the OCR pipeline.
@@ -68,50 +64,55 @@ def process_pdf(pdf_path):
         # Render page to an image (dpi=200 is generally good for OCR)
         pix = page.get_pixmap(dpi=200) 
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_img:
-            pix.save(temp_img.name)
+        # Create temp file, get the name, and close it immediately
+        temp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        temp_img_name = temp_img.name
+        temp_img.close() # <-- Releases the Windows lock!
+        
+        try:
+            # PyMuPDF writes to the file
+            pix.save(temp_img_name)
             
-            # Reuse your existing pipeline on the temporary image
-            _, niks = extract_nik_pipeline(temp_img.name)
+            # RapidOCR reads the file
+            _, niks = extract_nik_pipeline(temp_img_name)
             all_valid_niks.extend(niks)
             
-        # Clean up the temporary image for this page
-        os.remove(temp_img.name)
+        finally:
+            # Clean up the temporary image for this page
+            if os.path.exists(temp_img_name):
+                os.remove(temp_img_name)
+        
+    # Close the PDF document
+    doc.close()
         
     return len(all_valid_niks), all_valid_niks
 
-# 6. Define the API endpoint
+# 5. Define the API endpoint for file upload
 @app.post("/extract-family-members")
-async def extract_family_endpoint(request: DocumentRequest):
-    url = str(request.file_url)
+async def extract_family_endpoint(file: UploadFile = File(...)):
     
-    # Fetch the file from the URL
-    try:
-        response = requests.get(url, stream=True, timeout=15)
-        response.raise_for_status()
-        
-        # Determine file type based on headers
-        content_type = response.headers.get('Content-Type', '')
-        is_pdf = content_type == 'application/pdf'
-        is_image = content_type.startswith("image/")
-        
-        if not (is_pdf or is_image):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"URL must point to a valid image or PDF. Got: {content_type}"
-            )
-            
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch file from URL: {str(e)}")
+    # Determine file type based on the uploaded file's content type
+    content_type = file.content_type
+    is_pdf = content_type == 'application/pdf'
+    is_image = content_type.startswith("image/")
+    
+    if not (is_pdf or is_image):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Uploaded file must be a valid image or PDF. Got: {content_type}"
+        )
 
     temp_file_path = None
     try:
-        # Save the downloaded file to a temporary file
+        # Create temp file, get the name, and close it immediately
         suffix = ".pdf" if is_pdf else ".png"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_file.write(chunk)
-            temp_file_path = temp_file.name
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_file_path = temp_file.name
+        temp_file.close() # <-- Releases the Windows lock!
+
+        # Write the uploaded file using a standard 'open' block
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
         # Route to the appropriate processing function
         if is_pdf:
@@ -119,7 +120,7 @@ async def extract_family_endpoint(request: DocumentRequest):
         else:
             count, nik_strings = extract_nik_pipeline(temp_file_path)
 
-        # Deduplicate NIKs in case the PDF had overlapping scans or multiple identical pages
+        # Deduplicate NIKs
         unique_niks = list(set(nik_strings))
 
         return {
@@ -131,6 +132,8 @@ async def extract_family_endpoint(request: DocumentRequest):
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-        # Clean up the downloaded document
+        # Close the uploaded file stream
+        file.file.close()
+        # Clean up the temporary document on the disk
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
