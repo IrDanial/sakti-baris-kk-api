@@ -51,7 +51,6 @@ def extract_nik_pipeline(img_path):
     return match_count, valid_niks
 
 # 4. PDF Processing Pipeline
-# 4. PDF Processing Pipeline
 def process_pdf(pdf_path):
     """
     Opens a PDF, converts each page to an image, and runs the OCR pipeline.
