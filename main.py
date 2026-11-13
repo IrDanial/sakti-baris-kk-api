@@ -1,138 +1,196 @@
 import re
 import os
 import tempfile
-import shutil
+import requests
 import fitz  # PyMuPDF
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl
 from rapidocr_onnxruntime import RapidOCR
 
 # 1. Initialize FastAPI app
 app = FastAPI(
     title="Baris KK API",
-    description="API Untuk Mengekstrak Jumlah Anggota Keluarga dari Kartu Keluarga",
-    version="1.3.0"
+    description="API Untuk Mengekstrak Nama dan NIK Anggota Keluarga dari Kartu Keluarga",
+    version="1.4.0"
 )
 
 # 2. Initialize engine globally
 engine = RapidOCR()
 
-# 3. Core Image Processing Pipeline
-def extract_nik_pipeline(img_path):
+# 3. Define the expected request payload (Supabase URL)
+class DocumentRequest(BaseModel):
+    file_url: HttpUrl
+
+# 4. Core Image Processing Pipeline with Geometry Matching
+def extract_kk_pipeline(img_path):
     """
-    Takes an image path as input, runs RapidOCR, and extracts valid 16-digit NIKs.
-    Returns a tuple containing the count of matches and the matched strings.
+    Takes an image path as input, runs RapidOCR, extracts NIKs, 
+    and uses Bounding Box Geometry to pair NIKs with Names.
     """
     result, _ = engine(img_path)
     
-    valid_niks = []
+    fam_id = None
+    nik_data = []
+    people = []
+    
     nik_pattern = r'\b\d{16}\b'
     
-    # RapidOCR returns a list of tuples/lists depending on the version, 
-    # typically: [[box, text, confidence], ...]
-    if result:
-        # Extract just the text from the result
-        txts = [res[1] for res in result if len(res) > 1]
-        
-        for i, text_string in enumerate(txts):
-            cleaned_string = text_string.replace(" ", "")
-            matches = re.findall(nik_pattern, cleaned_string)
-            
-            if matches:
-                start_index = max(0, i - 2)
-                context_window = " ".join(txts[start_index : i+1]).upper()
-                
-                if "KK" in context_window or "KELUARGA" in context_window:
-                    print(f"Skipping detected Family ID")
-                    continue
-                
-                valid_niks.extend(matches)
-                
-    match_count = len(valid_niks)
-    return match_count, valid_niks
+    # If no text is found, return empty structure
+    if not result:
+        return [], []
 
-# 4. PDF Processing Pipeline
-def process_pdf(pdf_path):
-    """
-    Opens a PDF, converts each page to an image, and runs the OCR pipeline.
-    """
-    doc = fitz.open(pdf_path)
-    all_valid_niks = []
+    # ==========================================
+    # PASS 1: Find Family ID and NIK Geometries
+    # ==========================================
+    # result format: [[ [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], "Text", confidence ], ...]
+    for i, res in enumerate(result):
+        box = res[0]
+        text_string = res[1]
+        
+        cleaned_string = text_string.replace(" ", "")
+        matches = re.findall(nik_pattern, cleaned_string)
+        
+        if matches:
+            # Context Window to check for Family ID (No. KK)
+            start_index = max(0, i - 2)
+            context_window = " ".join([r[1] for r in result[start_index : i+1]]).upper()
+            
+            if "KK" in context_window or "KELUARGA" in context_window:
+                if not fam_id:
+                    fam_id = matches[0]
+                continue
+            
+            # Calculate the vertical center (Y) and left edge (X) of the NIK
+            # box format: [top-left, top-right, bottom-right, bottom-left]
+            y_center = sum(pt[1] for pt in box) / 4
+            x_left = box[0][0]
+            height = box[3][1] - box[0][1] # height of the text box
+            
+            nik_data.append({
+                "nik": matches[0],
+                "y_center": y_center,
+                "x_left": x_left,
+                "tolerance": height * 0.6  # 60% of text height tolerance
+            })
+
+    # ==========================================
+    # PASS 2: Match Names to NIK Rows
+    # ==========================================
+    for person in nik_data:
+        name_fragments = []
+        
+        for j, res in enumerate(result):
+            box = res[0]
+            text_string = res[1]
+            
+            cand_y_center = sum(pt[1] for pt in box) / 4
+            cand_x_right = box[1][0] # The right edge of the candidate text
+            
+            # 1. Is this text on the same horizontal row as the NIK?
+            if abs(cand_y_center - person["y_center"]) < person["tolerance"]:
+                # 2. Is this text to the LEFT of the NIK?
+                if cand_x_right < person["x_left"]:
+                    # 3. Does it contain letters? (Ignores numbers like "1", "2")
+                    if re.search(r'[A-Za-z]', text_string):
+                        name_fragments.append((box[0][0], text_string))
+        
+        # Sort words left-to-right
+        name_fragments.sort(key=lambda x: x[0])
+        
+        # Join the words together to form the full name
+        full_name = " ".join(" ".join([frag[1] for frag in name_fragments]).split())    
+        
+        people.append({
+            "name": full_name.upper() if full_name else "",
+            "nik": person["nik"]
+        })
+        
+    # Extract just the lists to return
+    nik_strings = [p["nik"] for p in people]
+    name_strings = [p["name"] for p in people]
     
-    # Iterate through every page in the PDF
+    return nik_strings, name_strings
+
+# 5. PDF Processing Pipeline
+def process_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    all_niks = []
+    all_names = []
+    
     for page in doc:
-        # Render page to an image (dpi=200 is generally good for OCR)
         pix = page.get_pixmap(dpi=200) 
         
-        # Create temp file, get the name, and close it immediately
+        # Windows-safe temporary file handling
         temp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         temp_img_name = temp_img.name
-        temp_img.close() # <-- Releases the Windows lock!
+        temp_img.close() # Release lock immediately
         
         try:
-            # PyMuPDF writes to the file
             pix.save(temp_img_name)
-            
-            # RapidOCR reads the file
-            _, niks = extract_nik_pipeline(temp_img_name)
-            all_valid_niks.extend(niks)
-            
+            niks, names = extract_kk_pipeline(temp_img_name)
+            all_niks.extend(niks)
+            all_names.extend(names)
         finally:
-            # Clean up the temporary image for this page
             if os.path.exists(temp_img_name):
                 os.remove(temp_img_name)
-        
-    # Close the PDF document
+                
     doc.close()
-        
-    return len(all_valid_niks), all_valid_niks
+    return all_niks, all_names
 
-# 5. Define the API endpoint for file upload
+# 6. Define the API endpoint
 @app.post("/extract-family-members")
-async def extract_family_endpoint(file: UploadFile = File(...)):
+async def extract_family_endpoint(request: DocumentRequest):
+    url = str(request.file_url)
     
-    # Determine file type based on the uploaded file's content type
-    content_type = file.content_type
-    is_pdf = content_type == 'application/pdf'
-    is_image = content_type.startswith("image/")
-    
-    if not (is_pdf or is_image):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Uploaded file must be a valid image or PDF. Got: {content_type}"
-        )
+    # Fetch file from Supabase URL
+    try:
+        response = requests.get(url, stream=True, timeout=15)
+        response.raise_for_status()
+        
+        content_type = response.headers.get('Content-Type', '')
+        is_pdf = content_type == 'application/pdf'
+        is_image = content_type.startswith("image/")
+        
+        if not (is_pdf or is_image):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"URL must point to a valid image or PDF. Got: {content_type}"
+            )
+            
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch file from URL: {str(e)}")
 
     temp_file_path = None
     try:
-        # Create temp file, get the name, and close it immediately
+        # Windows-safe temporary file handling for the downloaded document
         suffix = ".pdf" if is_pdf else ".png"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_file_path = temp_file.name
-        temp_file.close() # <-- Releases the Windows lock!
+        temp_file.close() # Release the lock!
 
-        # Write the uploaded file using a standard 'open' block
+        # Save downloaded chunks to the released temp file
         with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            for chunk in response.iter_content(chunk_size=8192):
+                buffer.write(chunk)
 
-        # Route to the appropriate processing function
+        # Route to appropriate processing function
         if is_pdf:
-            count, nik_strings = process_pdf(temp_file_path)
+            nik_strings, name_strings = process_pdf(temp_file_path)
         else:
-            count, nik_strings = extract_nik_pipeline(temp_file_path)
+            nik_strings, name_strings = extract_kk_pipeline(temp_file_path)
 
-        # Deduplicate NIKs
-        unique_niks = list(set(nik_strings))
-
+        # Return the strictly formatted JSON
         return {
-            "match_count": len(unique_niks),
-            "nik_strings": unique_niks
+            "match_count": len(nik_strings),
+            "nik_strings": nik_strings,
+            "name_count": len(name_strings),
+            "name_strings": name_strings
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-        # Close the uploaded file stream
-        file.file.close()
-        # Clean up the temporary document on the disk
+        # Clean up the main downloaded document
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
